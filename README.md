@@ -29,8 +29,8 @@ que el `Makefile`).
 
 ## Requisitos
 
-- GCC/G++ con soporte OpenMP y C++17 (compatible con GCC 13, incluido
-  por defecto en Ubuntu 24.04 LTS)
+- GCC/G++ con soporte OpenMP y C++17 (probado con GCC 13.3.0,
+  incluido por defecto en Ubuntu 24.04 LTS)
 - libssh2 (con headers de desarrollo)
 - libcurl (con headers de desarrollo)
 - make
@@ -44,6 +44,9 @@ sudo apt install build-essential libssh2-1-dev libcurl4-openssl-dev
 
 ## Compilación
 
+> Asegúrate de haber instalado las dependencias de la sección anterior
+> antes de compilar.
+
 ```bash
 make clean && make
 ```
@@ -55,14 +58,13 @@ Esto genera el ejecutable `cruz_morada` en la raíz del proyecto.
 ## Ejecución
 
 ```bash
-export OMP_NUM_THREADS=128
 ./cruz_morada
 ```
 
-> Se recomienda un número alto de hilos (ej. 128) porque el programa
-> es I/O-bound: la mayoría del tiempo los hilos esperan respuestas de
-> red (SFTP/API), no realizan cómputo intensivo. Esto permite muchas
-> más operaciones de E/S concurrentes que el número de núcleos físicos.
+> Por defecto, el programa utiliza el número de hilos lógicos
+> disponibles en el sistema (`omp_get_max_threads()`). La descarga
+> SFTP está limitada internamente a 8 hilos (ver "Notas sobre
+> paralelismo"), independientemente del valor de `OMP_NUM_THREADS`.
 
 ### Qué hace el programa al ejecutarse
 
@@ -86,5 +88,29 @@ export OMP_NUM_THREADS=128
 
 ---
 
+## Tiempos de ejecución
+
+- **Descarga SFTP inicial** (~910 archivos, ~2GB, 8 hilos paralelos):
+  el tiempo depende del ancho de banda disponible hacia el servidor
+  SFTP. En nuestras pruebas tomó aproximadamente 15 minutos.
+- **Procesamiento** (parseo de ~15.4M transacciones + cálculo de
+  promedios con `reduction`): ~22-34 segundos en una máquina con
+  múltiples cores físicos.
+- **Ejecuciones posteriores**: si los CSV ya están en `csv_files/` y
+  `cache_generos.txt` ya existe, solo se ejecuta la fase de
+  procesamiento (no hay descarga ni consultas a la API).
+
+## Notas sobre paralelismo
+
+- **Descarga SFTP**: limitada a 8 hilos por diseño. `libssh2` no
+  permite múltiples hilos sobre la misma conexión, y un número mayor
+  de conexiones simultáneas arriesga ser bloqueado por el firewall
+  del servidor.
+- **Parseo y cálculo**: escalan con el número de cores disponibles
+  (`omp_get_max_threads()`), usando `schedule(dynamic)` para balancear
+  archivos de distinto tamaño y `reduction` para acumular resultados
+  sin necesidad de secciones críticas.
+
+---
 
 ## Estructura del proyecto
