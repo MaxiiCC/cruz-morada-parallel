@@ -8,6 +8,9 @@
 #include <cstring>
 #include <cstdio>
 #include <iostream>
+#include <vector>
+#include <string>
+#include <omp.h>
 
 #define SFTP_HOST "137.184.45.251"
 #define SFTP_PORT 22
@@ -17,9 +20,13 @@
 #define LOCAL_DIR "csv_files"
 
 static void log_err(const std::string& msg) {
-    FILE* f = fopen("log.txt", "a");
-    if (f) { fprintf(f, "[SFTP] %s\n", msg.c_str()); fclose(f); }
-    std::cerr << "[SFTP] " << msg << "\n";
+    // PROTECCIÓN: Evita que los hilos choquen al escribir en el log
+    #pragma omp critical
+    {
+        FILE* f = fopen("log.txt", "a");
+        if (f) { fprintf(f, "[SFTP] %s\n", msg.c_str()); fclose(f); }
+        std::cerr << "[SFTP] " << msg << "\n";
+    }
 }
 
 static int conectar_tcp() {
@@ -72,6 +79,9 @@ int descargar_archivos() {
 
     if (libssh2_init(0) != 0) { log_err("libssh2_init fallo"); return -1; }
 
+    // ==========================================================
+    // FASE 1: Escaneo Secuencial (Obtener la lista de faltantes)
+    // ==========================================================
     int sock = conectar_tcp();
     if (sock < 0) { libssh2_exit(); return -1; }
 
@@ -104,9 +114,12 @@ int descargar_archivos() {
         libssh2_session_free(session); close(sock); libssh2_exit(); return -1;
     }
 
-    int descargados = 0;
+    int descargados_previos = 0;
+    std::vector<std::string> faltantes;
     char nombre[512];
     LIBSSH2_SFTP_ATTRIBUTES attrs;
+
+    std::cout << "[INFO] Escaneando servidor remoto...\n";
 
     while (libssh2_sftp_readdir(dir, nombre, sizeof(nombre), &attrs) > 0) {
         size_t len = strlen(nombre);
@@ -117,35 +130,84 @@ int descargar_archivos() {
         char local[600];
         snprintf(local, sizeof(local), "%s/%s", LOCAL_DIR, nombre);
 
-        // Saltar si ya existe
         FILE* test = fopen(local, "r");
         if (test) {
             fclose(test);
-            std::cout << "[SFTP] Ya existe: " << nombre << "\n";
-            descargados++;
-            continue;
-        }
-
-        char remoto[600];
-        snprintf(remoto, sizeof(remoto), "%s%s", SFTP_ROOT, nombre);
-
-        if (bajar_archivo(sftp_sess, remoto, local) == 0) {
-            std::cout << "[SFTP] Descargado: " << nombre << "\n";
-            descargados++;
+            // Comentado para no spamear la consola si ya hay 900 archivos
+            // std::cout << "[SFTP] Ya existe: " << nombre << "\n";
+            descargados_previos++;
         } else {
-            log_err(std::string("Error descargando: ") + nombre);
+            faltantes.push_back(std::string(nombre));
         }
     }
 
+    // Cerramos la conexion de escaneo
     libssh2_sftp_closedir(dir);
     libssh2_sftp_shutdown(sftp_sess);
     libssh2_session_disconnect(session, "Normal shutdown");
     libssh2_session_free(session);
     close(sock);
+
+    int total_faltantes = faltantes.size();
+    
+    if (total_faltantes == 0) {
+        std::cout << "[SFTP] Entorno al dia. No hay archivos nuevos.\n";
+        std::cout << "[SFTP] Total archivos en disco: " << descargados_previos << "\n";
+        libssh2_exit();
+        return descargados_previos;
+    }
+
+    std::cout << "[SFTP] Se detectaron " << total_faltantes << " archivos nuevos.\n";
+    std::cout << "[SFTP] Iniciando descarga paralela (Limite: 8 hilos)...\n";
+
+    // ==========================================================
+    // FASE 2: Descarga Paralela de archivos faltantes
+    // ==========================================================
+    int descargas_nuevas = 0;
+
+    // 8 hilos para no saturar el MaxStartups del servidor
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(8) reduction(+:descargas_nuevas)
+    for (int i = 0; i < total_faltantes; i++) {
+        std::string archivo = faltantes[i];
+        char local[600];
+        char remoto[600];
+        snprintf(local, sizeof(local), "%s/%s", LOCAL_DIR, archivo.c_str());
+        snprintf(remoto, sizeof(remoto), "%s%s", SFTP_ROOT, archivo.c_str());
+
+        // Cada hilo crea SU propia conexion
+        int t_sock = conectar_tcp();
+        if (t_sock < 0) continue;
+
+        LIBSSH2_SESSION* t_session = libssh2_session_init();
+        libssh2_session_set_blocking(t_session, 1);
+
+        if (libssh2_session_handshake(t_session, t_sock) != 0 || 
+            libssh2_userauth_password(t_session, SFTP_USER, SFTP_PASS) != 0) {
+            libssh2_session_free(t_session); close(t_sock); continue;
+        }
+
+        LIBSSH2_SFTP* t_sftp = libssh2_sftp_init(t_session);
+        if (t_sftp) {
+            if (bajar_archivo(t_sftp, remoto, local) == 0) {
+                #pragma omp critical
+                {
+                    std::cout << "[Hilo " << omp_get_thread_num() << "] Descargó: " << archivo << "\n";
+                }
+                descargas_nuevas++;
+            }
+            libssh2_sftp_shutdown(t_sftp);
+        }
+        
+        libssh2_session_disconnect(t_session, "Normal shutdown");
+        libssh2_session_free(t_session);
+        close(t_sock);
+    }
+
     libssh2_exit();
 
-    std::cout << "[SFTP] Total: " << descargados << " archivos\n";
-    return descargados;
+    int total_final = descargados_previos + descargas_nuevas;
+    std::cout << "[SFTP] Total: " << total_final << " archivos disponibles\n";
+    return total_final;
 }
 
 } // namespace sftp
