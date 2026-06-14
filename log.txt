@@ -1,0 +1,3 @@
+[CSV] csv_files/reporte_24300.csv: Fila 1805 malformada (4 campos)
+[CSV] csv_files/reporte_24312.csv: Fila 29935 malformada (2 campos)
+[CSV] csv_files/reporte_24136.csv: Fila 5777 malformada (9 campos)
