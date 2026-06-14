@@ -67,3 +67,10 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+cruz_morada
+log.txt
+salida.txt
+cache_generos.txt
+cache_uniq.txt
+csv_files/
+obj/
