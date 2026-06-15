@@ -72,13 +72,16 @@ Esto genera el ejecutable `cruz_morada` en la raíz del proyecto.
    secuencialmente qué archivos `reporte_*.csv` faltan en
    `csv_files/`, y luego los descarga en paralelo (8 hilos, cada uno
    con su propia sesión SSH/SFTP).
-2. **Parseo de CSV**: cada archivo se parsea y valida en paralelo
-   (`#pragma omp parallel for` con `schedule(dynamic)`).
-3. **Consulta API REST**: para cada `CODIGO CLIENTE` único, se
-   consulta el género vía API (autenticación JWT, con renovación
-   automática de token). Los resultados se cachean en RAM
-   (`unordered_map` + lock) y se persisten en disco
-   (`cache_generos.txt`) para evitar consultas redundantes.
+2. **Parseo de CSV y consulta de género**: cada archivo se procesa en
+   paralelo (`#pragma omp parallel for` con `schedule(dynamic)`), un
+   hilo por archivo. Dentro de cada iteración se parsean las filas del
+   CSV y, para cada transacción, se consulta el género del cliente
+   asociado (ver punto 3) dentro de la misma región paralela.
+3. **Consulta API REST**: para cada `CODIGO CLIENTE`, se consulta el
+   género vía API (autenticación JWT, con renovación automática de
+   token). Los resultados se cachean en RAM (`unordered_map` + lock) y
+   se persisten en disco (`cache_generos.txt`) para evitar consultas
+   redundantes.
 4. **Cálculo de métricas**: promedio de `MONTO APLICADO` por género,
    acumulado mediante `reduction` de OpenMP (sin locks explícitos
    sobre los acumuladores).
@@ -113,4 +116,37 @@ Esto genera el ejecutable `cruz_morada` en la raíz del proyecto.
 
 ---
 
+## Archivos de salida
+
+`resultados.txt` y `log.txt` se generan automáticamente en cada
+ejecución (y se sobrescriben/extienden respectivamente). Se incluye
+en el repositorio una versión de `log.txt` correspondiente a una
+ejecución de referencia, como evidencia del manejo de errores.
+
+---
+
+## Resultados de referencia
+
+Con el dataset completo (~910 archivos, ~15.4M transacciones):
+
+```text
+FEMENINO = 12488
+MASCULINO = 13076
+TIEMPO = 33.7577 segundos
+```
+
+---
+
 ## Estructura del proyecto
+
+```
+cruz-morada-parallel/
+├── include/          # Headers (api.h, csv.h, sftp.h)
+├── src/               # Implementación (api.cpp, csv.cpp, main.cpp, sftp.cpp)
+├── csv_files/         # CSVs descargados desde SFTP (no versionado)
+├── cache_generos.zip  # Caché de géneros pre-poblada (descomprimir antes de compilar)
+├── Makefile
+├── resultados.txt     # Salida del programa
+├── log.txt            # Registro de errores (ejemplo incluido como referencia)
+└── README.md
+```
