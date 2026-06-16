@@ -9,17 +9,21 @@
 #include <filesystem>
 #include <algorithm>
 
+// Credenciales para autenticacion JWT en la API REST.
 #define RUT   "21.371.052-4"
 #define EMAIL "mcamposc@utem.cl"
 
 namespace fs = std::filesystem;
 
+// Registra errores generales del orquestador en log.txt con prefijo [MAIN].
 static void log_err(const std::string& msg) {
     FILE* f = fopen("log.txt", "a");
     if (f) { fprintf(f, "[MAIN] %s\n", msg.c_str()); fclose(f); }
     std::cerr << "[MAIN] " << msg << "\n";
 }
 
+// Retorna las rutas de todos los archivos reporte_*.csv en el directorio dado,
+// ordenadas alfabeticamente para asegurar reproducibilidad entre ejecuciones.
 static std::vector<std::string> listar_csvs(const std::string& dir) {
     std::vector<std::string> rutas;
     for (const auto& entry : fs::directory_iterator(dir)) {
@@ -33,6 +37,7 @@ static std::vector<std::string> listar_csvs(const std::string& dir) {
 }
 
 int main() {
+    // Marca de tiempo inicial: incluye descarga SFTP, parseo y calculo.
     double t_inicio = omp_get_wtime();
 
     // ── 1. Descarga SFTP ─────────────────────────────────────────────
@@ -55,12 +60,13 @@ int main() {
     std::cout << "[INFO] Hilos: " << omp_get_max_threads() << "\n";
 
     // ── 3. Token JWT ─────────────────────────────────────────────────
+    // Carga la cache de generos desde disco (si existe) y obtiene token JWT.
     api::init(RUT, EMAIL);
 
     // ── 4. Procesamiento paralelo ────────────────────────────────────
     // Cada hilo toma un archivo CSV (schedule dynamic balancea archivos
     // de tamanos muy distintos), lo parsea y consulta el genero de cada
-    // cliente vía API (con cache). Los acumuladores se combinan al final
+    // cliente via API (con cache). Los acumuladores se combinan al final
     // mediante reduction, evitando condiciones de carrera sin usar locks
     // explicitos sobre las variables de suma/conteo.
     double suma_f  = 0.0, suma_m  = 0.0;
@@ -76,15 +82,22 @@ int main() {
         std::cout << "[Hilo " << tid << "] " << archivos[i]
                   << " -> " << transacciones.size() << " tx\n";
 
+        // Acumuladores locales por hilo: evitan contention sobre
+        // las variables compartidas durante el loop interno.
         double lsf = 0.0, lsm = 0.0;
         long   lcf = 0,   lcm = 0;
 
         for (const auto& t : transacciones) {
+            // api::consultar usa cache thread-safe: si el UUID ya fue
+            // resuelto, retorna sin trafico de red.
             Genero g = api::consultar(t.codigo_cliente);
             if      (g == Genero::FEMENINO)  { lsf += t.monto_aplicado; lcf++; }
             else if (g == Genero::MASCULINO) { lsm += t.monto_aplicado; lcm++; }
+            // Genero::DESCONOCIDO se ignora segun especificacion
         }
 
+        // Los acumuladores locales se suman a los globales.
+        // OpenMP los combina de forma segura via reduction al salir del bloque.
         suma_f  += lsf; suma_m  += lsm;
         count_f += lcf; count_m += lcm;
     }
@@ -112,6 +125,7 @@ int main() {
         log_err("No se pudo escribir resultados.txt");
     }
 
+    // Serializa la cache de generos a disco para reutilizar en la proxima ejecucion.
     api::cleanup();
     return 0;
 }

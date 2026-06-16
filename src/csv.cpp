@@ -3,18 +3,24 @@
 #include <iostream>
 #include <cstdio>
 
+// Registra errores de parseo en log.txt con prefijo [CSV].
+// Se abre y cierra el archivo en cada llamada para ser seguro
+// cuando multiples hilos escriben concurrentemente (modo append).
 static void log_err(const std::string& archivo, const std::string& msg) {
     FILE* f = fopen("log.txt", "a");
     if (f) { fprintf(f, "[CSV] %s: %s\n", archivo.c_str(), msg.c_str()); fclose(f); }
     std::cerr << "[CSV] " << archivo << ": " << msg << "\n";
 }
 
+// Elimina comillas dobles envolventes de un campo CSV si las tiene.
 static std::string strip_quotes(const std::string& s) {
     if (s.size() >= 2 && s.front() == '"' && s.back() == '"')
         return s.substr(1, s.size() - 2);
     return s;
 }
 
+// Divide una linea CSV por el separador ';', respetando campos entre
+// comillas dobles (donde ';' puede aparecer sin ser separador).
 static std::vector<std::string> split_linea(const std::string& linea) {
     std::vector<std::string> campos;
     std::string campo;
@@ -37,6 +43,8 @@ static std::vector<std::string> split_linea(const std::string& linea) {
     return campos;
 }
 
+// Nombres exactos de las 10 columnas esperadas, en el orden exacto.
+// Si el archivo no coincide campo a campo, se descarta completo.
 static const std::vector<std::string> HEADERS_ESPERADOS = {
     "FECHA", "CANAL", "SKU", "PRODUCTO", "UNIDADES",
     "PORCENTAJE DESCUENTO", "MONTO APLICADO", "BOLETA", "LOCAL", "CODIGO CLIENTE"
@@ -60,6 +68,7 @@ std::vector<Transaccion> parsear(const std::string& ruta) {
         log_err(ruta, "Archivo vacio");
         return resultado;
     }
+    // Eliminar \r para compatibilidad con archivos generados en Windows
     if (!linea.empty() && linea.back() == '\r') linea.pop_back();
 
     auto headers = split_linea(linea);
@@ -75,6 +84,8 @@ std::vector<Transaccion> parsear(const std::string& ruta) {
         }
     }
 
+    // Pre-reserva para evitar realocaciones durante el parseo.
+    // 30000 es una cota superior razonable de transacciones por archivo diario.
     resultado.reserve(30000);
 
     size_t fila = 1;
@@ -84,6 +95,7 @@ std::vector<Transaccion> parsear(const std::string& ruta) {
         if (linea.empty()) continue;
 
         auto campos = split_linea(linea);
+        // Filas con numero de campos incorrecto se descartan individualmente
         if (campos.size() != 10) {
             log_err(ruta, "Fila " + std::to_string(fila) + " malformada (" +
                     std::to_string(campos.size()) + " campos)");
@@ -103,6 +115,7 @@ std::vector<Transaccion> parsear(const std::string& ruta) {
             t.local                = campos[8];
             t.codigo_cliente       = campos[9];
         } catch (const std::exception& e) {
+            // Error de conversion de tipo: fila descartada, resto del archivo continua
             log_err(ruta, "Fila " + std::to_string(fila) +
                     " error conversion: " + e.what());
             continue;

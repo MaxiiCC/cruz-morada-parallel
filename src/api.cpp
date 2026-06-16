@@ -9,11 +9,14 @@
 #include <cstring>
 #include <unistd.h> // Necesario para usleep()
 
+// URLs de la API REST
 #define API_BASE   "https://api.sebastian.cl/cpyd"
 #define LOGIN_URL  API_BASE "/v1/login/authenticate"
 #define PERSON_URL API_BASE "/v1/person/"
 
 // ── Estado global del token ──────────────────────────────────────────
+// Protegido con g_token_lock: multiples hilos pueden detectar
+// expiracion simultaneamente y solo uno debe renovar.
 static std::string g_token;
 static long        g_token_exp = 0;
 static std::string g_rut;
@@ -21,10 +24,14 @@ static std::string g_email;
 static omp_lock_t  g_token_lock;
 
 // ── Cache UUID → Genero ──────────────────────────────────────────────
+// Protegido con g_cache_lock: el lock se libera antes de la peticion
+// HTTP para no bloquear hilos mientras esperan respuesta del servidor.
 static std::unordered_map<std::string, Genero> g_cache;
 static omp_lock_t g_cache_lock;
 
 // ── Logging ──────────────────────────────────────────────────────────
+// Apertura/cierre atomico en modo append: seguro para llamadas
+// concurrentes desde multiples hilos sin omp critical adicional.
 static void log_err(const std::string& msg) {
     FILE* f = fopen("log.txt", "a");
     if (f) { fprintf(f, "[API] %s\n", msg.c_str()); fclose(f); }
@@ -32,6 +39,8 @@ static void log_err(const std::string& msg) {
 }
 
 // ── Buffer HTTP ──────────────────────────────────────────────────────
+// Callback de escritura para libcurl: acumula la respuesta HTTP
+// en un string para procesarla despues de curl_easy_perform.
 struct Buffer { std::string data; };
 
 static size_t write_cb(void* ptr, size_t size, size_t nmemb, void* userp) {
@@ -40,6 +49,9 @@ static size_t write_cb(void* ptr, size_t size, size_t nmemb, void* userp) {
 }
 
 // ── Parseo JSON minimo ───────────────────────────────────────────────
+// Extrae el valor de un campo JSON por nombre, sin libreria externa.
+// Suficiente para la respuesta de /v1/person/{uuid} que tiene
+// estructura fija y solo necesitamos el campo "gender".
 static std::string json_get(const std::string& json, const std::string& key) {
     std::string buscar = "\"" + key + "\"";
     auto pos = json.find(buscar);
@@ -54,6 +66,9 @@ static std::string json_get(const std::string& json, const std::string& key) {
 }
 
 // ── Decodificar base64 ───────────────────────────────────────────────
+// Decodifica el payload del JWT (segunda seccion entre puntos)
+// para extraer el campo "exp" y saber cuando expira el token.
+// Implementado sin libreria externa: el payload tiene estructura simple.
 static std::string base64_decode(std::string s) {
     while (s.size() % 4) s += '=';
     const std::string chars =
@@ -77,6 +92,9 @@ static std::string base64_decode(std::string s) {
 }
 
 // ── Login ────────────────────────────────────────────────────────────
+// Autentica contra la API y almacena el token JWT en g_token.
+// Extrae el campo "exp" del payload para saber cuando expira.
+// No es thread-safe: debe llamarse siempre bajo g_token_lock.
 static bool hacer_login() {
     CURL* curl = curl_easy_init();
     if (!curl) { log_err("curl_easy_init fallo en login"); return false; }
@@ -111,7 +129,7 @@ static bool hacer_login() {
         return false;
     }
 
-    // Extraer exp del payload JWT
+    // Extraer exp del payload JWT (segunda seccion, decodificada en base64)
     long exp_time = 0;
     auto p1 = jwt.find('.');
     auto p2 = (p1 != std::string::npos) ? jwt.find('.', p1 + 1) : std::string::npos;
@@ -133,6 +151,9 @@ static bool hacer_login() {
 }
 
 // ── Verificar y renovar token si quedan menos de 60s ─────────────────
+// Llamada antes de cada peticion HTTP. El lock garantiza que si varios
+// hilos detectan expiracion simultaneamente, solo uno renueva el token
+// y los demas esperan y reutilizan el token ya renovado.
 static void asegurar_token() {
     omp_set_lock(&g_token_lock);
     long ahora = (long)time(nullptr);
@@ -146,6 +167,8 @@ static void asegurar_token() {
 // ── API publica ──────────────────────────────────────────────────────
 namespace api {
 
+// Inicializa curl, los locks de OpenMP, carga la cache desde disco
+// y obtiene el primer token JWT. Debe llamarse antes del bloque paralelo.
 void init(const std::string& rut, const std::string& email) {
     g_rut   = rut;
     g_email = email;
@@ -153,7 +176,7 @@ void init(const std::string& rut, const std::string& email) {
     omp_init_lock(&g_token_lock);
     omp_init_lock(&g_cache_lock);
     
-    // Cargar cache desde disco
+    // Cargar cache desde disco: cada linea es "UUID F|M"
     std::ifstream in("cache_generos.txt");
     if (in.is_open()) {
         std::string line;
@@ -172,8 +195,10 @@ void init(const std::string& rut, const std::string& email) {
     hacer_login();
 }
 
+// Serializa la cache RAM a disco y libera locks y recursos de curl.
+// Debe llamarse despues del bloque paralelo, desde un solo hilo.
 void cleanup() {
-    // Guardar la RAM en disco para la proxima vez
+    // Guardar la cache en disco para reutilizar en la proxima ejecucion
     std::ofstream out("cache_generos.txt");
     if (out.is_open()) {
         for (const auto& par : g_cache) {
@@ -191,7 +216,8 @@ void cleanup() {
 Genero consultar(const std::string& uuid) {
     if (uuid.empty()) return Genero::DESCONOCIDO;
 
-    // 1. Revisar cache
+    // 1. Revisar cache: el lock se toma y libera antes de cualquier
+    //    peticion HTTP para no bloquear hilos durante la espera de red.
     omp_set_lock(&g_cache_lock);
     auto it = g_cache.find(uuid);
     if (it != g_cache.end()) {
@@ -201,10 +227,12 @@ Genero consultar(const std::string& uuid) {
     }
     omp_unset_lock(&g_cache_lock);
 
-    // 2. Verificar token
+    // 2. Verificar token antes de la peticion
     asegurar_token();
 
-    // 3. Peticion HTTP (Con HTTP Keep-Alive y Reintentos)
+    // 3. Peticion HTTP con handle thread_local y reintentos
+    // thread_local: cada hilo reutiliza su propio handle de curl,
+    // evitando el overhead del handshake TLS en cada consulta.
     thread_local CURL* curl = nullptr;
     if (!curl) {
         curl = curl_easy_init();
@@ -217,6 +245,7 @@ Genero consultar(const std::string& uuid) {
     Buffer resp;
     std::string url = std::string(PERSON_URL) + uuid;
 
+    // Leer el token bajo lock para evitar leer un valor parcialmente escrito
     omp_set_lock(&g_token_lock);
     std::string auth = "Authorization: Bearer " + g_token;
     omp_unset_lock(&g_token_lock);
@@ -251,12 +280,14 @@ Genero consultar(const std::string& uuid) {
             exito = true;
         } 
         else if (http_code == 401) {
+            // Token expirado en medio de una peticion: forzar renovacion inmediata
             log_err("Token expirado (401), renovando...");
             omp_set_lock(&g_token_lock);
             g_token_exp = 0;
             omp_unset_lock(&g_token_lock);
             asegurar_token();
             
+            // Actualizar header con el nuevo token antes de reintentar
             omp_set_lock(&g_token_lock);
             auth = "Authorization: Bearer " + g_token;
             omp_unset_lock(&g_token_lock);
@@ -268,18 +299,19 @@ Genero consultar(const std::string& uuid) {
         } 
         else {
             if (intento == max_reintentos) {
+                // Fallo definitivo: UUID quedara como DESCONOCIDO
                 log_err("Fallo definitivo tras " + std::to_string(max_reintentos) + 
                         " intentos. uuid=" + uuid + " HTTP " + std::to_string(http_code) + 
                         " CURL: " + curl_easy_strerror(res));
             } else {
-                usleep(500000); 
+                usleep(500000); // 500ms de espera entre reintentos
             }
         }
     }
 
     curl_slist_free_all(headers);
 
-    // 4. Guardar en cache local (en RAM) para las siguientes iteraciones
+    // 4. Guardar en cache RAM para evitar consultas repetidas del mismo UUID
     if (genero != Genero::DESCONOCIDO) {
         omp_set_lock(&g_cache_lock);
         g_cache[uuid] = genero;

@@ -12,6 +12,7 @@
 #include <string>
 #include <omp.h>
 
+// Credenciales y configuracion del servidor SFTP remoto.
 #define SFTP_HOST "137.184.45.251"
 #define SFTP_PORT 22
 #define SFTP_USER "utem"
@@ -19,8 +20,10 @@
 #define SFTP_ROOT "/"
 #define LOCAL_DIR "csv_files"
 
+// Registra errores SFTP en log.txt con prefijo [SFTP].
+// Usa omp critical porque esta funcion puede ser llamada desde
+// multiples hilos durante la descarga paralela (Fase 2).
 static void log_err(const std::string& msg) {
-    // PROTECCIÓN: Evita que los hilos choquen al escribir en el log
     #pragma omp critical
     {
         FILE* f = fopen("log.txt", "a");
@@ -29,6 +32,9 @@ static void log_err(const std::string& msg) {
     }
 }
 
+// Abre una conexion TCP al servidor SFTP.
+// Retorna el file descriptor del socket, o -1 si falla.
+// Cada hilo de la Fase 2 llama a esta funcion de forma independiente.
 static int conectar_tcp() {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family   = AF_UNSPEC;
@@ -51,6 +57,9 @@ static int conectar_tcp() {
     return sock;
 }
 
+// Descarga un archivo remoto via SFTP y lo escribe en disco.
+// Lee en bloques de 64KB para minimizar llamadas al sistema.
+// Retorna 0 si exitoso, -1 si falla en apertura remota, local o lectura.
 static int bajar_archivo(LIBSSH2_SFTP* sftp, const char* remoto, const char* local) {
     LIBSSH2_SFTP_HANDLE* fh = libssh2_sftp_open(sftp, remoto, LIBSSH2_FXF_READ, 0);
     if (!fh) { log_err(std::string("No se pudo abrir: ") + remoto); return -1; }
@@ -81,6 +90,8 @@ int descargar_archivos() {
 
     // ==========================================================
     // FASE 1: Escaneo Secuencial (Obtener la lista de faltantes)
+    // libssh2 no es thread-safe sobre una misma sesion, por lo que
+    // el escaneo del directorio remoto se hace con una unica conexion.
     // ==========================================================
     int sock = conectar_tcp();
     if (sock < 0) { libssh2_exit(); return -1; }
@@ -121,6 +132,9 @@ int descargar_archivos() {
 
     std::cout << "[INFO] Escaneando servidor remoto...\n";
 
+    // Recorre el directorio raiz y filtra archivos reporte_*.csv.
+    // Si el archivo ya existe localmente, se cuenta como previo y se omite.
+    // Esto hace que cada ejecucion sea incremental: solo se bajan los nuevos.
     while (libssh2_sftp_readdir(dir, nombre, sizeof(nombre), &attrs) > 0) {
         size_t len = strlen(nombre);
         if (len < 12) continue;
@@ -141,7 +155,9 @@ int descargar_archivos() {
         }
     }
 
-    // Cerramos la conexion de escaneo
+    // Cierre explicito de la conexion de escaneo antes de la fase paralela.
+    // Es importante no dejar esta sesion abierta: libssh2 no es thread-safe
+    // y compartirla entre hilos causaria fallos impredecibles.
     libssh2_sftp_closedir(dir);
     libssh2_sftp_shutdown(sftp_sess);
     libssh2_session_disconnect(session, "Normal shutdown");
@@ -162,10 +178,12 @@ int descargar_archivos() {
 
     // ==========================================================
     // FASE 2: Descarga Paralela de archivos faltantes
+    // Limite de 8 hilos: valor determinado empiricamente para no
+    // saturar el parametro MaxStartups del servidor OpenSSH,
+    // que rechaza conexiones simultaneas excesivas.
     // ==========================================================
     int descargas_nuevas = 0;
 
-    // 8 hilos para no saturar el MaxStartups del servidor
     #pragma omp parallel for schedule(dynamic, 1) num_threads(8) reduction(+:descargas_nuevas)
     for (int i = 0; i < total_faltantes; i++) {
         std::string archivo = faltantes[i];
@@ -174,7 +192,9 @@ int descargar_archivos() {
         snprintf(local, sizeof(local), "%s/%s", LOCAL_DIR, archivo.c_str());
         snprintf(remoto, sizeof(remoto), "%s%s", SFTP_ROOT, archivo.c_str());
 
-        // Cada hilo crea SU propia conexion
+        // Cada hilo crea su propia conexion TCP + sesion SSH + sesion SFTP.
+        // No hay estado compartido en la transferencia: cada hilo es completamente
+        // independiente y cierra sus recursos al terminar su archivo.
         int t_sock = conectar_tcp();
         if (t_sock < 0) continue;
 
@@ -189,6 +209,7 @@ int descargar_archivos() {
         LIBSSH2_SFTP* t_sftp = libssh2_sftp_init(t_session);
         if (t_sftp) {
             if (bajar_archivo(t_sftp, remoto, local) == 0) {
+                // omp critical para que los mensajes de consola no se entrelacen
                 #pragma omp critical
                 {
                     std::cout << "[Hilo " << omp_get_thread_num() << "] Descargó: " << archivo << "\n";
@@ -198,6 +219,7 @@ int descargar_archivos() {
             libssh2_sftp_shutdown(t_sftp);
         }
         
+        // Cierre de todos los recursos del hilo al terminar su archivo
         libssh2_session_disconnect(t_session, "Normal shutdown");
         libssh2_session_free(t_session);
         close(t_sock);
